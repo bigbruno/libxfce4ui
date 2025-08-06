@@ -253,6 +253,11 @@ xfce_icon_view_layout_rows (XfceIconView *icon_view,
                             gint *maximum_width,
                             gint max_cols);
 static void
+xfce_icon_view_layout_fast (XfceIconView *icon_view);
+static void
+xfce_icon_view_layout_precise_row (XfceIconView *icon_view,
+                                   XfceIconViewItem *item);
+static void
 xfce_icon_view_layout (XfceIconView *icon_view);
 static void
 xfce_icon_view_paint_item (XfceIconView *icon_view,
@@ -567,6 +572,7 @@ struct _XfceIconViewItem
   guint col : ((sizeof (guint) / 2) * 8) - 1;
   guint selected : 1;
   guint selected_before_rubberbanding : 1;
+  guint needs_layout : 1;
 };
 
 typedef struct _XfceIconViewPrivate
@@ -2002,6 +2008,12 @@ xfce_icon_view_draw (GtkWidget *widget,
       /* check whether we are clipped fully */
       if (!gdk_rectangle_intersect (&paint_area, &clip, NULL))
         continue;
+
+      /* perform precise layout if needed */
+      if (item->needs_layout)
+      {
+          xfce_icon_view_layout_precise_row(icon_view, item);
+      }
 
       /* paint the item */
       xfce_icon_view_paint_item (icon_view, item, cr, item->area.x, item->area.y, TRUE);
@@ -3548,17 +3560,200 @@ xfce_icon_view_layout_rows (XfceIconView *icon_view,
 
 
 static void
+xfce_icon_view_layout_fast (XfceIconView *icon_view)
+{
+  XfceIconViewPrivate *priv = get_instance_private (icon_view);
+  XfceIconViewItem *item, *sample_item;
+  GSequenceIter *iter;
+  gint item_height = 80; /* Default estimate */
+  gint item_width = 100;  /* Default estimate */
+  gint rows, cols;
+  gboolean rtl;
+  GtkAllocation allocation;
+  gint num_items;
+  gint current_col, current_row;
+
+  if (g_sequence_is_empty (priv->items))
+  {
+    priv->width = 0;
+    priv->height = 0;
+    return;
+  }
+
+  gtk_widget_get_allocation (GTK_WIDGET (icon_view), &allocation);
+  rtl = (gtk_widget_get_direction (GTK_WIDGET (icon_view)) == GTK_TEXT_DIR_RTL);
+  num_items = g_sequence_get_length(priv->items);
+
+  /* Get a sample item size from the first item */
+  iter = g_sequence_get_begin_iter (priv->items);
+  sample_item = g_sequence_get (iter);
+
+  /* The first item's size must be calculated precisely to be used as a sample */
+  xfce_icon_view_calculate_item_size(icon_view, sample_item);
+  item_width = sample_item->area.width > 0 ? sample_item->area.width : 100;
+  item_height = sample_item->area.height > 0 ? sample_item->area.height : 80;
+
+  /* Mark all items as needing layout */
+  for (iter = g_sequence_get_begin_iter (priv->items); !g_sequence_iter_is_end (iter); iter = g_sequence_iter_next (iter))
+  {
+      item = g_sequence_get (iter);
+      item->needs_layout = 1;
+  }
+  sample_item->needs_layout = 0; /* The sample doesn't need it. */
+
+  if (G_LIKELY (priv->layout_mode == XFCE_ICON_VIEW_LAYOUT_ROWS))
+  {
+    if (priv->columns > 0) {
+        cols = priv->columns;
+    } else {
+        cols = (allocation.width > 0) ? (allocation.width - 2 * priv->margin + priv->column_spacing) / (item_width + priv->column_spacing) : 1;
+    }
+    if (cols <= 0) cols = 1;
+
+    priv->cols = cols;
+    rows = (num_items + cols - 1) / cols;
+    priv->rows = rows;
+
+    priv->width = MAX(allocation.width, cols * (item_width + priv->column_spacing) - priv->column_spacing + 2 * priv->margin);
+    priv->height = rows * (item_height + priv->row_spacing) - priv->row_spacing + 2 * priv->margin;
+
+    current_col = 0;
+    current_row = 0;
+    for (iter = g_sequence_get_begin_iter (priv->items); !g_sequence_iter_is_end (iter); iter = g_sequence_iter_next (iter))
+    {
+      item = g_sequence_get (iter);
+      item->row = current_row;
+      item->col = rtl ? (cols - 1 - current_col) : current_col;
+
+      item->area.x = priv->margin + item->col * (item_width + priv->column_spacing);
+      item->area.y = priv->margin + item->row * (item_height + priv->row_spacing);
+      item->area.width = item_width;
+      item->area.height = item_height;
+
+      current_col++;
+      if (current_col >= cols) {
+          current_col = 0;
+          current_row++;
+      }
+    }
+  }
+  else /* XFCE_ICON_VIEW_LAYOUT_COLS */
+  {
+    if (priv->columns > 0) { /* In this mode, 'columns' property means number of fixed rows */
+        rows = priv->columns;
+    } else {
+        rows = (allocation.height > 0) ? (allocation.height - 2 * priv->margin + priv->row_spacing) / (item_height + priv->row_spacing) : 1;
+    }
+    if (rows <= 0) rows = 1;
+
+    priv->rows = rows;
+    cols = (num_items + rows - 1) / rows;
+    priv->cols = cols;
+
+    priv->height = MAX(allocation.height, rows * (item_height + priv->row_spacing) - priv->row_spacing + 2 * priv->margin);
+    priv->width = cols * (item_width + priv->column_spacing) - priv->column_spacing + 2 * priv->margin;
+
+    current_col = 0;
+    current_row = 0;
+    for (iter = g_sequence_get_begin_iter (priv->items); !g_sequence_iter_is_end (iter); iter = g_sequence_iter_next (iter))
+    {
+        item = g_sequence_get (iter);
+        item->row = current_row;
+        item->col = current_col;
+
+        item->area.x = priv->margin + item->col * (item_width + priv->column_spacing);
+        item->area.y = priv->margin + item->row * (item_height + priv->row_spacing);
+        item->area.width = item_width;
+        item->area.height = item_height;
+
+        current_row++;
+        if (current_row >= rows) {
+            current_row = 0;
+            current_col++;
+        }
+    }
+  }
+}
+
+static void
+xfce_icon_view_layout_precise_row (XfceIconView *icon_view,
+                                   XfceIconViewItem *start_item)
+{
+  XfceIconViewPrivate *priv = get_instance_private (icon_view);
+  gint row_to_layout = start_item->row;
+  GSequenceIter *iter;
+  GList *row_items = NULL;
+  XfceIconViewItem *item;
+
+  if (!start_item->needs_layout)
+      return;
+
+  /* 1. Find all items in the row */
+  for (iter = g_sequence_get_begin_iter(priv->items); !g_sequence_iter_is_end(iter); iter = g_sequence_iter_next(iter))
+  {
+      item = g_sequence_get(iter);
+      if (item->row == row_to_layout)
+      {
+          row_items = g_list_prepend(row_items, item);
+      }
+      else if (item->row > row_to_layout)
+      {
+          break;
+      }
+  }
+  row_items = g_list_reverse(row_items);
+
+  if (g_list_length(row_items) == 0) {
+      g_list_free(row_items);
+      return;
+  }
+
+  gint i;
+  gint *max_width = g_newa0(gint, priv->n_cells);
+  gint *max_height = g_newa0(gint, priv->n_cells);
+  gint old_row_height, new_row_height = 0;
+
+  item = (XfceIconViewItem*)row_items->data;
+  old_row_height = item->area.height; /* Get estimated height */
+
+  /* Pass 1: Calculate precise individual sizes and find max cell dimensions */
+  for (GList *l = row_items; l != NULL; l = l->next)
+  {
+      item = (XfceIconViewItem*)l->data;
+      item->area.width = -1; /* Force recalculation */
+      xfce_icon_view_calculate_item_size(icon_view, item);
+      for (i = 0; i < priv->n_cells; i++)
+      {
+          max_width[i] = MAX(max_width[i], item->box[i].width);
+          max_height[i] = MAX(max_height[i], item->box[i].height);
+      }
+  }
+
+  /* Pass 2: Align items within the row */
+  for (GList *l = row_items; l != NULL; l = l->next)
+  {
+      item = (XfceIconViewItem*)l->data;
+      xfce_icon_view_calculate_item_size2(icon_view, item, max_width, max_height);
+      item->needs_layout = 0;
+      if (item->area.height > new_row_height)
+          new_row_height = item->area.height;
+  }
+
+  gint delta_y = new_row_height - old_row_height;
+
+  if (delta_y != 0)
+  {
+      priv->height += delta_y;
+      xfce_icon_view_set_adjustment_upper(priv->vadjustment, priv->height);
+  }
+
+  g_list_free(row_items);
+}
+
+static void
 xfce_icon_view_layout (XfceIconView *icon_view)
 {
   XfceIconViewPrivate *priv = get_instance_private (icon_view);
-  XfceIconViewItem *item;
-  GSequenceIter *iter;
-  gint maximum_height = 0;
-  gint maximum_width = 0;
-  gint item_height;
-  gint item_width;
-  gint rows, cols;
-  gint x, y;
   GtkAllocation allocation;
   GtkRequisition requisition;
 
@@ -3568,73 +3763,11 @@ xfce_icon_view_layout (XfceIconView *icon_view)
 
   gtk_widget_get_allocation (GTK_WIDGET (icon_view), &allocation);
 
+  /* New fast layout */
+  xfce_icon_view_layout_fast(icon_view);
+
   gtk_widget_get_preferred_width (GTK_WIDGET (icon_view), NULL, &requisition.width);
   gtk_widget_get_preferred_height (GTK_WIDGET (icon_view), NULL, &requisition.height);
-
-  /* determine the layout mode */
-  if (G_LIKELY (priv->layout_mode == XFCE_ICON_VIEW_LAYOUT_ROWS))
-    {
-      /* calculate item sizes on-demand */
-      item_width = priv->item_width;
-      if (item_width < 0)
-        {
-          for (iter = g_sequence_get_begin_iter (priv->items);
-               !g_sequence_iter_is_end (iter);
-               iter = g_sequence_iter_next (iter))
-            {
-              item = g_sequence_get (iter);
-              xfce_icon_view_calculate_item_size (icon_view, item);
-              item_width = MAX (item_width, item->area.width);
-            }
-        }
-
-      cols = xfce_icon_view_layout_rows (icon_view, item_width, &y, &maximum_width, 0);
-
-      /* If, by adding another column, we increase the height of the icon view, thus forcing a
-       * vertical scrollbar to appear that would prevent the last column from being able to fit,
-       * we need to relayout the icons with one less column.
-       */
-      if (cols == priv->cols + 1
-          && y > allocation.height
-          && priv->height <= allocation.height)
-        {
-          cols = xfce_icon_view_layout_rows (icon_view, item_width, &y, &maximum_width, priv->cols);
-        }
-
-      priv->width = maximum_width;
-      priv->height = y;
-      priv->cols = cols;
-    }
-  else
-    {
-      /* calculate item sizes on-demand */
-      item_height = 0;
-      for (iter = g_sequence_get_begin_iter (priv->items);
-           !g_sequence_iter_is_end (iter);
-           iter = g_sequence_iter_next (iter))
-        {
-          item = g_sequence_get (iter);
-          xfce_icon_view_calculate_item_size (icon_view, item);
-          item_height = MAX (item_height, item->area.height);
-        }
-
-      rows = xfce_icon_view_layout_cols (icon_view, item_height, &x, &maximum_height, 0);
-
-      /* If, by adding another row, we increase the width of the icon view, thus forcing a
-       * horizontal scrollbar to appear that would prevent the last row from being able to fit,
-       * we need to relayout the icons with one less row.
-       */
-      if (rows == priv->rows + 1
-          && x > allocation.width
-          && priv->width <= allocation.width)
-        {
-          rows = xfce_icon_view_layout_cols (icon_view, item_height, &x, &maximum_height, priv->rows);
-        }
-
-      priv->height = maximum_height;
-      priv->width = x;
-      priv->rows = rows;
-    }
 
   xfce_icon_view_set_adjustment_upper (priv->hadjustment, priv->width);
   xfce_icon_view_set_adjustment_upper (priv->vadjustment, priv->height);
@@ -4200,10 +4333,8 @@ xfce_icon_view_row_changed (GtkTreeModel *model,
   if (G_UNLIKELY (item->selected))
     g_signal_emit (icon_view, icon_view_signals[SELECTION_CHANGED], 0);
 
-  /* recalculate layout (a value of -1 for width
-   * indicates that the item needs to be layouted).
-   */
-  item->area.width = -1;
+  /* recalculate layout */
+  item->needs_layout = 1;
   xfce_icon_view_queue_layout (icon_view);
 }
 
@@ -4231,6 +4362,7 @@ xfce_icon_view_row_inserted (GtkTreeModel *model,
   item = g_slice_new0 (XfceIconViewItem);
   item->iter = *iter;
   item->area.width = -1;
+  item->needs_layout = 1;
 
   if (g_sequence_iter_is_end (item_iter))
     item_iter = g_sequence_append (priv->items, item);
@@ -5934,6 +6066,7 @@ xfce_icon_view_set_model (XfceIconView *icon_view,
               item = g_slice_new0 (XfceIconViewItem);
               item->iter = iter;
               item->area.width = -1;
+              item->needs_layout = 1;
               item_iter = g_sequence_append (priv->items, item);
               item->item_iter = item_iter;
             }
@@ -6613,6 +6746,9 @@ xfce_icon_view_scroll_to_path (XfceIconView *icon_view,
       item = g_sequence_get (iter);
       if (G_UNLIKELY (item == NULL))
         return;
+
+      if (item->needs_layout)
+        xfce_icon_view_layout_precise_row(icon_view, item);
 
       if (use_align)
         {
